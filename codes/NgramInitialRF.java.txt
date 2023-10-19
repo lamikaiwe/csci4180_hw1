@@ -1,0 +1,167 @@
+import java.io.IOException;
+import java.util.StringTokenizer;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.Queue;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.MapWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+
+public class NgramInitialRF {
+
+    public static class TokenizerMapper
+            extends Mapper<Object, Text, Text, MapWritable>{
+
+            private HashMap<String, MapWritable> count = null;
+            
+            private int N = 0;
+            private Queue<String> queue = null;
+
+            private final static IntWritable one = new IntWritable(1);
+            private Text word = new Text();
+            
+            protected void setup(Context context) throws IOException, InterruptedException {
+                count = new HashMap<String, MapWritable>();
+                Configuration conf = context.getConfiguration();
+                N = Integer.parseInt(conf.get("N"));
+                queue = new LinkedList<String>();
+            }
+
+            public void map(Object key, Text value, Context context
+                    ) throws IOException, InterruptedException {
+                    StringTokenizer itr = new StringTokenizer(value.toString(), ",' \t\n\r\f1234567890");
+                    for(int j = 0; j < N - 1; j++){
+                        if(itr.hasMoreTokens()){
+                            String token = itr.nextToken();
+                            String intital = token.charAt(0) + "";
+                            queue.add(intital);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    while (itr.hasMoreTokens()) {
+                        String token = itr.nextToken();
+                        String intital = token.charAt(0) + "";
+                        queue.add(intital);
+
+                        if(count.containsKey(intital)){
+                            MapWritable stripe = count.get(intital);
+                            Text all = new Text("*");
+                            if(stripe.containsKey(all)){
+                                IntWritable len = (IntWritable) stripe.get(all);
+                                int sum = len.get() + 1;
+                                stripe.put(all, new IntWritable(sum));
+                            } else {
+                                stripe.put(all, one);
+                            }
+                        } else {
+                            MapWritable new_map = new MapWritable();
+                            new_map.put(new Text("*"),one);
+                            count.put(intital, new_map);
+                        }
+
+                        String head = queue.poll();
+                        String sub_gram = "";
+
+                        for(String s : queue){
+                            sub_gram += " " + s;
+                        }
+                        Text sub_gram_t = new Text(sub_gram);
+                        if(count.containsKey(head)){
+                            MapWritable stripe = count.get(head);
+                            if(stripe.containsKey(sub_gram_t)){
+                                IntWritable len = (IntWritable) stripe.get(sub_gram_t);
+                                int sum = len.get() + 1;
+                                stripe.put(sub_gram_t, new IntWritable(sum));
+                            } else {
+                                stripe.put(sub_gram_t,one);
+                            }
+                        } else {
+                            MapWritable new_map = new MapWritable();
+                            new_map.put(sub_gram_t,one);
+                            count.put(head, new_map);
+                        }
+                    }
+                }
+            protected void cleanup(Context context) throws IOException, InterruptedException {
+                for(String key : count.keySet()){
+                    context.write(new Text(key), count.get(key));
+                }
+            }
+    }
+
+    public static class IntSumReducer
+            extends Reducer<Text,MapWritable,Text,IntWritable> {
+            
+            private float theta = 0;
+
+            Configuration conf = context.getConfiguration();
+            private theta = Float.parsefloat(conf.get("theta"));
+
+            public void reduce(Text key, Iterable<MapWritable> maps,
+                    Context context
+                    ) throws IOException, InterruptedException {
+                MapWritable all_map = new MapWritable();
+
+                for (MapWritable map : maps) {
+                    for(Writable w : map.keySet()){
+                        Text sub_gram_t = (Text) w;
+                        if(all_map.containsKey(sub_gram_t)){
+                            IntWritable i = (IntWritable) all_map.get(sub_gram_t);
+                            IntWritable j = (IntWritable) map.get(sub_gram_t);
+                            int sum = i.get() + j.get();
+                            all_map.put(sub_gram_t,new IntWritable(sum));
+                        } else {
+                            all_map.put(sub_gram_t,map.get(sub_gram_t));
+                        }
+                    }
+                }
+                String head = key.toString();
+                IntWritable fre_w = (IntWritable) all_map.get(new Text("*"));
+                int fre = fre_w.get();
+                float f_fre = (float) fre;
+
+                for(Writable w : all_map.keySet()){
+                    Text sub_gram_t = (Text) w;
+                    if(sub_gram_t.toString() == "*"){
+                        continue;
+                    }
+                    String n_gram = head + sub_gram_t.toString();
+                    IntWritable k = (IntWritable) all_map.get(sub_gram_t);
+                    int r_fre = k.get();
+                    int RF = r_fre / f_fre;
+                    if(RF > theta){
+                        context.write(new Text(n_gram), k);
+                    }
+                }
+                }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Configuration conf = new Configuration();
+        conf.set("N",args[2]);
+        conf.set("theta",args[3]);
+        Job job = Job.getInstance(conf, "N gram RF");
+        job.setJarByClass(NgramInitialRF.class);
+        job.setMapperClass(TokenizerMapper.class);
+        job.setCombinerClass(IntSumReducer.class);
+        job.setReducerClass(IntSumReducer.class);
+        job.setMapOutputKeyClass(Text.class);
+        job.setOutputKeyClass(Text.class);
+        job.setMapOutputValueClass(MapWritable.class);
+        job.setOutputValueClass(IntWritable.class);
+        FileInputFormat.addInputPath(job, new Path(args[0]));
+        FileOutputFormat.setOutputPath(job, new Path(args[1]));
+        System.exit(job.waitForCompletion(true) ? 0 : 1);
+    }
+}
